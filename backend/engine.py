@@ -28,6 +28,13 @@ from .live_trading import (
     place_protection_orders,
 )
 from .llm import ModelDecisionParseError, generate_trading_decision, provider_status
+from .prompt_format import klines_by_interval_to_csv
+from .token_monitor import (
+    context_window_for,
+    estimate_tokens,
+    evaluate_token_usage,
+    format_log_line,
+)
 from .market import (
     build_candidate_snapshot,
     candidate_universe_from_scan,
@@ -621,6 +628,91 @@ def serialize_candidate_for_history(candidate: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def _convert_context_klines_to_csv(context: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy of context with every klinesByInterval field
+    converted from list-of-dicts to compact CSV strings.
+
+    Touches only candidates[*].klinesByInterval and marketBackdrop.klinesByInterval.
+    All other fields pass through unchanged.
+
+    See backend/prompt_format.py for the CSV layout. Token savings on real
+    production data: ~80% per K-line series, see ROADMAP.md stage 1.
+    """
+    def _convert_node(node: dict[str, Any]) -> dict[str, Any]:
+        kbi = node.get("klinesByInterval")
+        if kbi is None:
+            return node
+        return {**node, "klinesByInterval": klines_by_interval_to_csv(kbi)}
+
+    out = dict(context)
+    if isinstance(out.get("candidates"), list):
+        out["candidates"] = [
+            _convert_node(c) if isinstance(c, dict) else c for c in out["candidates"]
+        ]
+    if isinstance(out.get("marketBackdrop"), dict):
+        out["marketBackdrop"] = _convert_node(out["marketBackdrop"])
+    return out
+
+
+def _check_token_budget_pre_call(
+    prompt: str,
+    provider: dict[str, Any],
+    *,
+    cycle_id: str | None = None,
+) -> dict[str, Any]:
+    """Estimate prompt tokens before sending to LLM and decide whether to BLOCK.
+
+    Returns the dict from token_monitor.evaluate_token_usage. Caller should:
+      * always print(result["log_line"])
+      * if result["should_block"] is True: skip the API call, append
+        result["warning_text"] to cycle.warnings, fall back to default
+        decision.
+      * else: proceed with the API call as usual.
+    """
+    estimated = estimate_tokens(prompt)
+    window = context_window_for(provider)
+    result = evaluate_token_usage(estimated, window)
+    # Override the log line so it's clearly marked as the *estimate* phase.
+    result["log_line"] = format_log_line(
+        estimated, window, result["level"], result["pct"],
+        cycle_id=cycle_id, extra="estimated, pre-call",
+    )
+    return result
+
+
+def _report_token_budget_post_call(
+    model_result: dict[str, Any] | None,
+    provider: dict[str, Any],
+    *,
+    cycle_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Read the *real* prompt_tokens from API usage and produce a final report.
+
+    Returns the evaluation dict (with WARN/DANGER text suitable for warnings),
+    or None if the model_result has no usage info (e.g. the API failed before
+    returning).
+    """
+    if not isinstance(model_result, dict):
+        return None
+    raw = model_result.get("rawResponse") or {}
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    real_pt = usage.get("prompt_tokens")
+    if not isinstance(real_pt, (int, float)) or real_pt <= 0:
+        return None
+    window = context_window_for(provider)
+    result = evaluate_token_usage(int(real_pt), window)
+    cached = usage.get("prompt_cache_hit_tokens")
+    extra = f"cached={cached}" if isinstance(cached, (int, float)) else None
+    extra = (extra + " | actual, post-call") if extra else "actual, post-call"
+    result["log_line"] = format_log_line(
+        int(real_pt), window, result["level"], result["pct"],
+        cycle_id=cycle_id, extra=extra,
+    )
+    return result
+
+
 def serialize_candidate_for_prompt(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
         **serialize_candidate_for_history(candidate),
@@ -819,10 +911,32 @@ def build_prompt(
                 "",
             ]
         )
+    # K-line format switch (default: "csv", token-optimized; "json" = legacy verbose).
+    # Settable per instance via trading_settings.json -> "klineFormat".
+    kline_format = str(settings.get("klineFormat") or "csv").strip().lower()
+    if kline_format not in {"csv", "json"}:
+        kline_format = "csv"
+    print(
+        f"[engine][build_prompt] mode={settings.get('mode')} "
+        f"klineFormat={kline_format} "
+        f"({'token-optimized ~80% smaller' if kline_format == 'csv' else 'legacy verbose mode'})",
+        flush=True,
+    )
+    if kline_format == "csv":
+        context_for_prompt = _convert_context_klines_to_csv(context)
+        context_header = (
+            "# Current Trading Context\n"
+            "# Note: klinesByInterval values are CSV text. Header `t,o,h,l,c,v` where\n"
+            "#   t = openTime in seconds (10-digit unix); o,h,l,c = open/high/low/close;\n"
+            "#   v = volume rounded to integer; rows are oldest-first."
+        )
+    else:
+        context_for_prompt = context
+        context_header = "# Current Trading Context"
     sections.extend(
         [
-            "# Current Trading Context",
-            json.dumps(context, ensure_ascii=False, indent=2),
+            context_header,
+            json.dumps(context_for_prompt, ensure_ascii=False, indent=2),
         ]
     )
     return "\n".join(sections)
@@ -2341,25 +2455,44 @@ def run_trading_cycle(reason: str = "manual", mode_override: str | None = None, 
         historical_lessons=historical_lessons,
     )
     model_result: dict[str, Any] | None = None
-    try:
-        model_result = generate_trading_decision(prompt, provider, read_network_settings(instance_id))
-        parsed_model = normalize_model_decision(
-            model_result["parsed"],
-            open_positions=account_before["openPositions"],
-            candidates_by_symbol=candidates_by_symbol,
-        )
-    except ModelDecisionParseError as error:
-        warnings.append(f"Model decision failed: {error}")
+    # T8: pre-call token budget guard (refuse if estimated >= 95% of context window)
+    pre_budget = _check_token_budget_pre_call(prompt, provider, cycle_id=decision_id)
+    print(pre_budget["log_line"], flush=True)
+    if pre_budget["should_block"]:
+        warnings.append(pre_budget["warning_text"])
+        parsed_model = default_model_decision(account_before["openPositions"])
         model_result = {
-            "provider": error.provider_result,
-            "rawText": error.raw_text,
-            "rawResponse": error.raw_response,
+            "provider": {"preset": provider.get("preset"), "apiStyle": provider.get("apiStyle"), "model": provider.get("model"), "tokenBudgetBlocked": True},
+            "rawText": "",
+            "rawResponse": {},
             "parsed": {},
         }
-        parsed_model = default_model_decision(account_before["openPositions"])
-    except Exception as error:
-        warnings.append(f"Model decision failed: {error}")
-        parsed_model = default_model_decision(account_before["openPositions"])
+    else:
+        try:
+            model_result = generate_trading_decision(prompt, provider, read_network_settings(instance_id))
+            parsed_model = normalize_model_decision(
+                model_result["parsed"],
+                open_positions=account_before["openPositions"],
+                candidates_by_symbol=candidates_by_symbol,
+            )
+        except ModelDecisionParseError as error:
+            warnings.append(f"Model decision failed: {error}")
+            model_result = {
+                "provider": error.provider_result,
+                "rawText": error.raw_text,
+                "rawResponse": error.raw_response,
+                "parsed": {},
+            }
+            parsed_model = default_model_decision(account_before["openPositions"])
+        except Exception as error:
+            warnings.append(f"Model decision failed: {error}")
+            parsed_model = default_model_decision(account_before["openPositions"])
+    # T8: post-call token budget report using *real* prompt_tokens from API usage
+    post_budget = _report_token_budget_post_call(model_result, provider, cycle_id=decision_id)
+    if post_budget is not None:
+        print(post_budget["log_line"], flush=True)
+        if post_budget["warning_text"] and post_budget["warning_text"] not in warnings:
+            warnings.append(post_budget["warning_text"])
     management_actions = list(protection_actions) + trailing_actions
     for instruction in parsed_model["position_actions"]:
         position = next((item for item in list(book.get("openPositions", [])) if item["symbol"] == instruction["symbol"]), None)
@@ -2765,12 +2898,23 @@ def preview_trading_prompt_decision(mode_override: str | None = None, prompt_ove
         candidates=candidate_snapshots,
         historical_lessons=historical_lessons,
     )
+    # T8: token budget log for preview/test mode (do NOT block — user is
+    # explicitly testing and wants to see the failure mode if it happens).
+    pre_budget = _check_token_budget_pre_call(prompt, provider, cycle_id="preview")
+    print(pre_budget["log_line"], flush=True)
+    if pre_budget["should_block"]:
+        warnings.append(pre_budget["warning_text"])
     model_result = generate_trading_decision(prompt, provider, read_network_settings(instance_id))
     parsed_model = normalize_model_decision(
         model_result["parsed"],
         open_positions=account_summary["openPositions"],
         candidates_by_symbol=candidates_by_symbol,
     )
+    post_budget = _report_token_budget_post_call(model_result, provider, cycle_id="preview")
+    if post_budget is not None:
+        print(post_budget["log_line"], flush=True)
+        if post_budget["warning_text"] and post_budget["warning_text"] not in warnings:
+            warnings.append(post_budget["warning_text"])
     warnings = dedupe_messages(warnings)
     result = {
         "mode": settings["mode"],

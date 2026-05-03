@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -11,6 +14,25 @@ from .utils import DATA_DIR, now_iso, read_json, sha1_hex, write_json
 
 
 CACHE_DIR = DATA_DIR / "cache" / "http"
+
+# Retry policy for transient network failures. Backoffs in seconds between
+# attempts; the length of this tuple is also the number of *retries* (the
+# initial attempt is in addition to these). Keep it small to avoid stalling
+# the trading loop on a truly dead route.
+_RETRY_BACKOFFS: tuple[float, ...] = (0.4, 1.0)
+
+# Substrings that indicate a low-level SSL/TLS handshake failure where the
+# request body has not been delivered to the server yet. Retrying these is
+# safe even for write operations (POST/PUT/DELETE) such as live order
+# placement, because the server never saw the request.
+_RETRYABLE_SSL_HINTS: tuple[str, ...] = (
+    "EOF occurred in violation of protocol",
+    "UNEXPECTED_EOF_WHILE_READING",
+    "WRONG_VERSION_NUMBER",
+    "decryption failed or bad record mac",
+    "TLSV1_ALERT_INTERNAL_ERROR",
+    "SSLV3_ALERT_HANDSHAKE_FAILURE",
+)
 
 
 class HttpRequestError(RuntimeError):
@@ -86,6 +108,37 @@ def _build_opener(url: str, network_settings: dict[str, Any] | None):
     return build_opener()
 
 
+def _is_retryable_url_error(error: URLError, method_upper: str) -> bool:
+    """Decide whether a URLError is safe and worthwhile to retry.
+
+    SSL handshake failures are always retryable — the request body never
+    reached the server, so even non-idempotent calls (live order placement)
+    cannot have been duplicated. For other transport-level failures
+    (timeouts, connection resets) we restrict retries to GET because GET is
+    the only method we can assume idempotent in this codebase.
+    """
+    reason = error.reason
+    if isinstance(reason, ssl.SSLError):
+        if isinstance(reason, ssl.SSLEOFError):
+            return True
+        message = str(reason)
+        return any(hint in message for hint in _RETRYABLE_SSL_HINTS)
+    if method_upper != "GET":
+        return False
+    if isinstance(
+        reason,
+        (TimeoutError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError, socket.timeout),
+    ):
+        return True
+    if isinstance(reason, OSError):
+        # ECONNRESET on macOS is errno 54, on Linux 104. Either way the
+        # remote killed the socket before any response, so a GET retry is
+        # safe.
+        if reason.errno in {54, 104}:
+            return True
+    return False
+
+
 def request_text(
     method: str,
     url: str,
@@ -104,7 +157,8 @@ def request_text(
         body = payload.encode("utf-8")
     else:
         body = json.dumps(payload).encode("utf-8")
-    request = Request(url=url, method=method.upper(), data=body)
+    method_upper = method.upper()
+    request = Request(url=url, method=method_upper, data=body)
     merged_headers = {
         "accept": "application/json",
         "user-agent": "python-trading-agent/1.0",
@@ -115,19 +169,39 @@ def request_text(
     for key, value in merged_headers.items():
         request.add_header(key, value)
     opener = _build_opener(url, network_settings or {})
-    try:
-        with opener.open(request, timeout=timeout_seconds) as response:
-            return response.read().decode("utf-8")
-    except HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        retry_after = error.headers.get("Retry-After") if error.headers else None
-        raise HttpRequestError(
-            f"{error.code} {error.reason}: {detail}",
-            status_code=error.code,
-            retry_after=retry_after,
-        ) from error
-    except URLError as error:
-        raise HttpRequestError(str(error.reason)) from error
+
+    # Initial attempt + entries in _RETRY_BACKOFFS as retries. We sleep
+    # *before* each retry (not before the first attempt).
+    last_url_error: URLError | None = None
+    for attempt_index in range(len(_RETRY_BACKOFFS) + 1):
+        if attempt_index > 0:
+            time.sleep(_RETRY_BACKOFFS[attempt_index - 1])
+        try:
+            with opener.open(request, timeout=timeout_seconds) as response:
+                return response.read().decode("utf-8")
+        except HTTPError as error:
+            # The server actually responded (4xx/5xx). Never retry here —
+            # for write operations like order placement a retry could
+            # double-submit, and for reads the same input will deterministically
+            # produce the same status.
+            detail = error.read().decode("utf-8", errors="replace")
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            raise HttpRequestError(
+                f"{error.code} {error.reason}: {detail}",
+                status_code=error.code,
+                retry_after=retry_after,
+            ) from error
+        except URLError as error:
+            last_url_error = error
+            has_more_attempts = attempt_index < len(_RETRY_BACKOFFS)
+            if has_more_attempts and _is_retryable_url_error(error, method_upper):
+                continue
+            raise HttpRequestError(str(error.reason)) from error
+
+    # Defensive: the loop above always returns or raises, but mypy/readers
+    # appreciate an explicit terminal raise.
+    assert last_url_error is not None
+    raise HttpRequestError(str(last_url_error.reason)) from last_url_error
 
 
 def request_json(
