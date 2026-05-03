@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "updated": "2026-04-22",
-  "proxyEnabled": false,
-  "proxyUrl": "",
+  "updated": "2026-05-02",
+  "proxyEnabled": true,
+  "proxyUrl": "http://127.0.0.1:1082",
   "noProxy": [
     "127.0.0.1",
     "localhost"

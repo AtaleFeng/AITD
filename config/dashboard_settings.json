@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "updated": "2026-04-22",
+  "updated": "2026-05-02",
   "timezone": "Asia/Shanghai",
-  "pageAutoRefreshSeconds": 600,
+  "pageAutoRefreshSeconds": 60,
   "marketAutoScanEnabled": true,
   "marketScanIntervalMinutes": 60,
   "marketScanOffsetMinute": 7
